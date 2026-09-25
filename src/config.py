@@ -1,6 +1,9 @@
 """
 Centralized, Dynamic Configuration & Hardware Discovery Module.
-Supports automatic discovery across local repository and Kaggle environments (including dual NVIDIA T4 GPUs).
+
+Paths are always relative to the cloned repository root (parent of ``src/``).
+Works the same after ``git clone`` on Colab, local machines, or Kaggle.
+Optional env overrides: ``DATASET_DIR``, ``OUTPUT_DIR``, ``RESULTS_DIR``, ``LOGS_DIR``.
 """
 
 import os
@@ -18,8 +21,48 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-# Base Paths
-PROJECT_ROOT = Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+def resolve_project_root(start: Optional[Path] = None) -> Path:
+    """
+    Resolve the repository root that contains ``src/config.py``.
+
+    Prefers the package location (``__file__``), then walks upward from
+    ``start`` / cwd so notebooks started in a subfolder still find the clone.
+    """
+    if start is None:
+        start = Path.cwd()
+    start = Path(start).resolve()
+
+    package_root = Path(__file__).resolve().parent.parent
+    if (package_root / "src" / "config.py").exists():
+        return package_root
+
+    for candidate in [start, *start.parents]:
+        if (candidate / "src" / "config.py").exists():
+            return candidate
+    return package_root
+
+
+def is_colab() -> bool:
+    """True when running inside Google Colab."""
+    if "COLAB_RELEASE_TAG" in os.environ or "COLAB_GPU" in os.environ:
+        return True
+    if os.environ.get("GOOGLE_COLAB", "").lower() in {"1", "true"}:
+        return True
+    try:
+        import google.colab  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def is_kaggle() -> bool:
+    """True when running inside a Kaggle notebook/kernel."""
+    return Path("/kaggle/input").exists() or "KAGGLE_KERNEL_RUN_TYPE" in os.environ
+
+
+# Base Paths: always the cloned repo root
+PROJECT_ROOT = resolve_project_root()
 
 
 def get_hardware_info() -> Dict[str, Any]:
@@ -54,14 +97,10 @@ def get_hardware_info() -> Dict[str, Any]:
 
 def print_gpu_info() -> None:
     """
-    Prints hardware and GPU information in the required Kaggle monitoring format:
-    GPU count:
-    GPU 0:
-    GPU 1:
-    CUDA version:
-    PyTorch CUDA availability:
+    Prints hardware and GPU information (Colab / Kaggle / local).
     """
     info = get_hardware_info()
+    print(f"Runtime: Colab={is_colab()} Kaggle={is_kaggle()}")
     print(f"GPU count: {info['gpu_count']}")
     if info["gpu_count"] > 0:
         for i, g in enumerate(info["gpus"]):
@@ -70,6 +109,29 @@ def print_gpu_info() -> None:
         print("GPU 0: None detected (CPU fallback enabled)")
     print(f"CUDA version: {info['cuda_version']}")
     print(f"PyTorch CUDA availability: {info['cuda_available']}")
+    print(f"CPU count: {info['cpu_count']}")
+    print(f"RAM available: {info['available_ram_gb']} / {info['total_ram_gb']} GB")
+    print(f"Project root: {PROJECT_ROOT}")
+    out = globals().get("OUTPUT_DIR", PROJECT_ROOT / "output")
+    data = globals().get("DATASET_DIR", PROJECT_ROOT / "dataset")
+    print(f"Output dir: {out}")
+    print(f"Dataset dir: {data}")
+
+
+def ensure_dataset_ready() -> Path:
+    """Raise a clear error if train/test TSVs are missing (common Colab setup miss)."""
+    required = [
+        TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GROUND_TRUTH_PATH,
+        TEST_S1_PATH, TEST_S2_PATH, TEST_S3_PATH,
+    ]
+    missing = [str(p) for p in required if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(
+            "Dataset files missing. Put the competition `dataset/train` and "
+            "`dataset/test` folders under this clone, or set DATASET_DIR, then "
+            f"call refresh_paths(). Missing:\n  - " + "\n  - ".join(missing)
+        )
+    return DATASET_DIR
 
 
 def release_memory() -> None:
@@ -114,42 +176,136 @@ class StageTimer:
 
 
 
+def _looks_like_dataset_dir(path: Path) -> bool:
+    """True if path contains train/ and test/ (competition layout)."""
+    return path.is_dir() and (path / "train").is_dir() and (path / "test").is_dir()
+
+
+def _candidate_dataset_dirs(base_hint: Optional[Path] = None) -> List[Path]:
+    """Ordered list of relative / common places to look for the dataset."""
+    root = PROJECT_ROOT
+    cwd = Path.cwd().resolve()
+    candidates: List[Path] = []
+
+    env_dir = os.environ.get("DATASET_DIR")
+    if env_dir:
+        candidates.append(Path(env_dir).expanduser().resolve())
+
+    if base_hint:
+        hint = Path(base_hint).expanduser().resolve()
+        candidates.extend([hint, hint / "dataset", hint / "student_resource" / "dataset"])
+
+    # Prefer paths next to the clone (Colab / local / sibling student_resource)
+    candidates.extend([
+        root / "dataset",
+        root / "student_resource" / "dataset",
+        root / "data" / "dataset",
+        root.parent / "student_resource" / "dataset",
+        root.parent / "dataset",
+        cwd / "dataset",
+        cwd / "student_resource" / "dataset",
+        cwd.parent / "student_resource" / "dataset",
+    ])
+
+    # Colab common mounts
+    if Path("/content").exists():
+        candidates.extend([
+            Path("/content/dataset"),
+            Path("/content/student_resource/dataset"),
+            Path("/content/drive/MyDrive/amazon_ml/student_resource/dataset"),
+            Path("/content/drive/MyDrive/student_resource/dataset"),
+        ])
+
+    # Kaggle optional fallback (never preferred over relative clone paths)
+    if is_kaggle():
+        candidates.append(Path("/kaggle/input"))
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique: List[Path] = []
+    for path in candidates:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def _find_dataset_under(root: Path, max_depth: int = 3) -> Optional[Path]:
+    """
+    Find a train/+test/ dataset directory under root without deep walks.
+    Depth-limited to keep Colab/Kaggle discovery fast.
+    """
+    if not root.exists():
+        return None
+    if _looks_like_dataset_dir(root):
+        return root
+
+    # Shallow BFS
+    frontier = [root]
+    for _ in range(max_depth):
+        next_frontier: List[Path] = []
+        for node in frontier:
+            try:
+                children = [p for p in node.iterdir() if p.is_dir()]
+            except OSError:
+                continue
+            for child in children:
+                if _looks_like_dataset_dir(child):
+                    return child
+                next_frontier.append(child)
+        frontier = next_frontier
+    return None
+
+
 def discover_dataset_paths(base_hint: Optional[Path] = None) -> Dict[str, Path]:
     """
-    Dynamically discovers train and test dataset files without hardcoding folder names.
-    Searches base_hint, /kaggle/input, and project directory.
-    """
-    search_roots = []
-    if base_hint and Path(base_hint).exists():
-        search_roots.append(Path(base_hint))
-    if Path("/kaggle/input").exists():
-        search_roots.append(Path("/kaggle/input"))
-    search_roots.append(PROJECT_ROOT)
+    Discover train/test TSV paths relative to the cloned repository.
 
-    dataset_dir = None
-    for root in search_roots:
-        for r, dirs, files in os.walk(root):
-            if "train" in dirs and "test" in dirs:
-                dataset_dir = Path(r)
-                break
-        if dataset_dir:
+    Search order: ``DATASET_DIR`` env → repo-relative folders → Colab mounts →
+    sibling ``student_resource`` → optional Kaggle input.
+    """
+    dataset_dir: Optional[Path] = None
+    for candidate in _candidate_dataset_dirs(base_hint):
+        if not candidate.exists():
+            continue
+        if _looks_like_dataset_dir(candidate):
+            dataset_dir = candidate
+            break
+        depth = 3 if candidate.name in {"input", "content", "MyDrive"} else 2
+        found = _find_dataset_under(candidate, max_depth=depth)
+        if found is not None:
+            dataset_dir = found
             break
 
-    if not dataset_dir:
+    if dataset_dir is None:
         dataset_dir = PROJECT_ROOT / "dataset"
+        logger.warning(
+            "[CONFIG] Dataset not found yet. Expected at %s "
+            "(or set DATASET_DIR). Place train/ and test/ under it.",
+            dataset_dir,
+        )
+    else:
+        logger.info("[CONFIG] Using dataset at %s", dataset_dir)
 
     train_dir = dataset_dir / "train"
     test_dir = dataset_dir / "test"
 
     def find_file(d: Path, pattern: str) -> Path:
-        matches = list(d.glob(pattern))
-        if matches:
-            return matches[0]
-        # Fallback to direct name
-        clean_name = pattern.replace("*", "")
-        return d / clean_name
+        if d.is_dir():
+            matches = sorted(d.glob(pattern))
+            if matches:
+                return matches[0]
+        split = "train" if d.name == "train" else "test"
+        conventional = {
+            "*source1*.tsv": f"{split}_source1.tsv",
+            "*source2*.tsv": f"{split}_source2.tsv",
+            "*source3*.tsv": f"{split}_source3.tsv",
+            "*ground_truth*.tsv": "train_ground_truth.tsv",
+        }
+        return d / conventional.get(pattern, pattern.replace("*", ""))
 
-    paths = {
+    return {
         "dataset_dir": dataset_dir,
         "train_dir": train_dir,
         "test_dir": test_dir,
@@ -161,40 +317,105 @@ def discover_dataset_paths(base_hint: Optional[Path] = None) -> Dict[str, Path]:
         "test_s2": find_file(test_dir, "*source2*.tsv"),
         "test_s3": find_file(test_dir, "*source3*.tsv"),
     }
-    return paths
 
 
-# Discover paths dynamically
-DISCOVERED_PATHS = discover_dataset_paths()
-DATASET_DIR = DISCOVERED_PATHS["dataset_dir"]
-TRAIN_DIR = DISCOVERED_PATHS["train_dir"]
-TEST_DIR = DISCOVERED_PATHS["test_dir"]
+def resolve_runtime_dirs() -> Dict[str, Path]:
+    """
+    Writable dirs always live under the clone (or env overrides).
 
-TRAIN_S1_PATH = DISCOVERED_PATHS["train_s1"]
-TRAIN_S2_PATH = DISCOVERED_PATHS["train_s2"]
-TRAIN_S3_PATH = DISCOVERED_PATHS["train_s3"]
-TRAIN_GROUND_TRUTH_PATH = DISCOVERED_PATHS["train_gt"]
+    Never hardcodes ``/kaggle/working`` so Colab/local clones stay self-contained.
+    """
+    def _env_or_relative(env_key: str, relative: str) -> Path:
+        raw = os.environ.get(env_key)
+        if raw:
+            return Path(raw).expanduser().resolve()
+        return PROJECT_ROOT / relative
 
-TEST_S1_PATH = DISCOVERED_PATHS["test_s1"]
-TEST_S2_PATH = DISCOVERED_PATHS["test_s2"]
-TEST_S3_PATH = DISCOVERED_PATHS["test_s3"]
+    return {
+        "output": _env_or_relative("OUTPUT_DIR", "output"),
+        "results": _env_or_relative("RESULTS_DIR", "results"),
+        "logs": _env_or_relative("LOGS_DIR", "logs"),
+    }
 
-# Writable Output & Results Dirs
-if Path("/kaggle/input").exists():
-    OUTPUT_DIR = Path("/kaggle/working/output")
-    RESULTS_DIR = Path("/kaggle/working/results")
-    LOGS_DIR = Path("/kaggle/working/logs")
-else:
-    OUTPUT_DIR = PROJECT_ROOT / "output"
-    RESULTS_DIR = PROJECT_ROOT / "results"
-    LOGS_DIR = PROJECT_ROOT / "logs"
 
-for p in [OUTPUT_DIR, RESULTS_DIR, LOGS_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
+def apply_discovered_paths(paths: Optional[Dict[str, Path]] = None) -> Dict[str, Path]:
+    """Bind module-level path globals from a discovery result."""
+    global DISCOVERED_PATHS, DATASET_DIR, TRAIN_DIR, TEST_DIR
+    global TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GROUND_TRUTH_PATH
+    global TEST_S1_PATH, TEST_S2_PATH, TEST_S3_PATH
+    global OUTPUT_DIR, RESULTS_DIR, LOGS_DIR
+    global SUBMISSION_MATCHING_PATH, SUBMISSION_CANDIDATE_PATH, SUBMISSION_PREDICTIONS_PATH
 
-SUBMISSION_MATCHING_PATH = OUTPUT_DIR / "matching_results.tsv"
-SUBMISSION_CANDIDATE_PATH = OUTPUT_DIR / "candidate_pairs.tsv"
-SUBMISSION_PREDICTIONS_PATH = OUTPUT_DIR / "predictions.tsv"
+    DISCOVERED_PATHS = paths or discover_dataset_paths()
+    DATASET_DIR = DISCOVERED_PATHS["dataset_dir"]
+    TRAIN_DIR = DISCOVERED_PATHS["train_dir"]
+    TEST_DIR = DISCOVERED_PATHS["test_dir"]
+    TRAIN_S1_PATH = DISCOVERED_PATHS["train_s1"]
+    TRAIN_S2_PATH = DISCOVERED_PATHS["train_s2"]
+    TRAIN_S3_PATH = DISCOVERED_PATHS["train_s3"]
+    TRAIN_GROUND_TRUTH_PATH = DISCOVERED_PATHS["train_gt"]
+    TEST_S1_PATH = DISCOVERED_PATHS["test_s1"]
+    TEST_S2_PATH = DISCOVERED_PATHS["test_s2"]
+    TEST_S3_PATH = DISCOVERED_PATHS["test_s3"]
+
+    runtime = resolve_runtime_dirs()
+    OUTPUT_DIR = runtime["output"]
+    RESULTS_DIR = runtime["results"]
+    LOGS_DIR = runtime["logs"]
+    for p in (OUTPUT_DIR, RESULTS_DIR, LOGS_DIR):
+        p.mkdir(parents=True, exist_ok=True)
+
+    SUBMISSION_MATCHING_PATH = OUTPUT_DIR / "matching_results.tsv"
+    SUBMISSION_CANDIDATE_PATH = OUTPUT_DIR / "candidate_pairs.tsv"
+    SUBMISSION_PREDICTIONS_PATH = OUTPUT_DIR / "predictions.tsv"
+    return DISCOVERED_PATHS
+
+
+def refresh_paths(base_hint: Optional[Path] = None) -> Dict[str, Path]:
+    """
+    Re-run discovery after mounting Drive / uploading data in Colab.
+
+    Example::
+        from src.config import refresh_paths, print_runtime_paths
+        refresh_paths("/content/drive/MyDrive/student_resource")
+        print_runtime_paths()
+    """
+    global PROJECT_ROOT
+    PROJECT_ROOT = resolve_project_root()
+    return apply_discovered_paths(discover_dataset_paths(base_hint))
+
+
+def print_runtime_paths() -> None:
+    """Print resolved project / dataset / output paths for debugging."""
+    print(f"Project root:  {PROJECT_ROOT}")
+    print(f"Dataset dir:   {DATASET_DIR}")
+    print(f"Train dir:     {TRAIN_DIR}  exists={TRAIN_DIR.exists()}")
+    print(f"Test dir:      {TEST_DIR}  exists={TEST_DIR.exists()}")
+    print(f"Output dir:    {OUTPUT_DIR}")
+    print(f"Results dir:   {RESULTS_DIR}")
+    print(f"Colab:         {is_colab()}  Kaggle: {is_kaggle()}")
+
+
+# Discover paths dynamically (relative to this clone)
+DISCOVERED_PATHS: Dict[str, Path] = {}
+DATASET_DIR: Path
+TRAIN_DIR: Path
+TEST_DIR: Path
+TRAIN_S1_PATH: Path
+TRAIN_S2_PATH: Path
+TRAIN_S3_PATH: Path
+TRAIN_GROUND_TRUTH_PATH: Path
+TEST_S1_PATH: Path
+TEST_S2_PATH: Path
+TEST_S3_PATH: Path
+OUTPUT_DIR: Path
+RESULTS_DIR: Path
+LOGS_DIR: Path
+SUBMISSION_MATCHING_PATH: Path
+SUBMISSION_CANDIDATE_PATH: Path
+SUBMISSION_PREDICTIONS_PATH: Path
+
+apply_discovered_paths()
 
 # Reproducibility Seed
 RANDOM_SEED = 42

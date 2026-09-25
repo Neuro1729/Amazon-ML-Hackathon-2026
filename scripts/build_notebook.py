@@ -73,7 +73,7 @@ def create_notebook():
 ### High-Precision, Multilingual, Scalable Record Linkage Architecture
 **Team:** Enterprise Entity Matchers  
 **Metric:** Macro $F_{0.5}$ (Precision-Weighted Entity Resolution)  
-**Target Hardware:** Kaggle Free Tier (2× NVIDIA T4 GPUs / Multi-Core CPU Fallback)
+**Target Hardware:** Google Colab GPU / Kaggle / local multi-core CPU (paths relative to this clone)
 
 ---
 
@@ -147,22 +147,28 @@ import tarfile
 from pathlib import Path
 
 # Standalone Kaggle session auto-bootstrap:
-# If 'src' directory does not exist on disk, self-extract embedded bundle
-if not ((Path.cwd() / "src").exists() or (Path.cwd().parent / "src").exists()):
-    print("[STANDALONE BOOTSTRAP] 'src' directory not found. Unpacking self-contained codebase...")
+# Resolve clone root (Colab / local / Kaggle). Prefer walking up for src/config.py.
+def _resolve_repo_root() -> Path:
+    cwd = Path.cwd().resolve()
+    for candidate in [cwd, *cwd.parents]:
+        if (candidate / "src" / "config.py").exists():
+            return candidate
+    return cwd
+
+PROJECT_ROOT = _resolve_repo_root()
+os.chdir(PROJECT_ROOT)
+
+# If 'src' is missing (uploaded notebook only), unpack the embedded bundle into the clone root
+if not (PROJECT_ROOT / "src" / "config.py").exists():
+    print("[STANDALONE BOOTSTRAP] 'src' not found. Unpacking embedded codebase...")
     _bundle_data = b'''__CODEBASE_BUNDLE_B64__'''
     _buf = io.BytesIO(base64.b64decode(_bundle_data))
     with tarfile.open(fileobj=_buf, mode="r:gz") as _tar:
-        _tar.extractall(path=Path.cwd())
-    print("[STANDALONE BOOTSTRAP] Successfully unpacked 'src' and 'utils' to current workspace.")
+        _tar.extractall(path=PROJECT_ROOT)
+    print("[STANDALONE BOOTSTRAP] Unpacked 'src' and 'utils' into", PROJECT_ROOT)
 
-# Auto-detect project root and add to sys.path
-PROJECT_ROOT = Path(os.getcwd()).resolve()
-if (PROJECT_ROOT / "src").exists():
+if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
-elif (PROJECT_ROOT.parent / "src").exists():
-    sys.path.insert(0, str(PROJECT_ROOT.parent))
-    PROJECT_ROOT = PROJECT_ROOT.parent
 
 from src.config import (
     TRAIN_S1_PATH, TRAIN_S2_PATH, TRAIN_S3_PATH, TRAIN_GROUND_TRUTH_PATH,
@@ -170,9 +176,13 @@ from src.config import (
     SUBMISSION_MATCHING_PATH, SUBMISSION_CANDIDATE_PATH,
     RESULTS_DIR, OUTPUT_DIR, RANDOM_SEED, BETA, MODEL_PARAMS,
     SAMPLE_S1_ROWS, SAMPLE_QUERY_ROWS, SAMPLE_ACTIVE_QUERIES, MAX_TEST_QUERIES,
-    DEFAULT_CHUNK_SIZE, DEFAULT_RETRIEVAL_BATCH,
-    print_gpu_info, release_memory, StageTimer, get_hardware_info, get_available_devices
+    DEFAULT_CHUNK_SIZE, DEFAULT_RETRIEVAL_BATCH, DATASET_DIR,
+    print_gpu_info, release_memory, StageTimer, get_hardware_info, get_available_devices,
+    refresh_paths, print_runtime_paths, is_colab, is_kaggle,
 )
+
+# Re-discover after chdir / Drive mount (safe no-op when already relative)
+refresh_paths()
 
 print("=" * 60)
 print("[HARDWARE & RUNTIME ENVIRONMENT]")
@@ -183,12 +193,14 @@ stage_timer = StageTimer()
 
 print("\\n[CONFIG] Configuration loaded successfully.")
 print(f"  Project Root: {PROJECT_ROOT}")
+print(f"  Dataset Dir:  {DATASET_DIR}")
 print(f"  Output Dir:   {OUTPUT_DIR}")
 print(f"  Results Dir:  {RESULTS_DIR}")
 print(f"  Random Seed:  {RANDOM_SEED}")
 print(f"  Evaluation Beta: {BETA} (Macro F{BETA})")
 print(f"  Streaming Chunk Size:    {DEFAULT_CHUNK_SIZE:,}")
 print(f"  Retrieval Batch Size:   {DEFAULT_RETRIEVAL_BATCH:,}")
+print_runtime_paths()
 """.replace("__CODEBASE_BUNDLE_B64__", codebase_b64)
     add_code(cell1_code)
 

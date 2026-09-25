@@ -9,6 +9,7 @@ Provides rigorous training with:
 - Clean metrics recording (rows, positive ratio, feature count, training time, best score)
 """
 
+import os
 import time
 import pickle
 import lightgbm as lgb
@@ -75,9 +76,16 @@ class EntityMatcherModel:
         
         start_t = time.time()
         
-        # Adjust scale_pos_weight or use balanced parameters if needed
+        # LightGBM: default CPU (pip wheels rarely include GPU). Opt-in via USE_LGBM_GPU=1.
         model_params = self.params.copy()
-        # LightGBM Classifier with robust GPU/CPU fallback
+        use_lgbm_gpu = os.environ.get("USE_LGBM_GPU", "").lower() in {"1", "true", "yes"}
+        if use_lgbm_gpu:
+            model_params.setdefault("device", "gpu")
+        else:
+            model_params["device"] = "cpu"
+            model_params.pop("gpu_platform_id", None)
+            model_params.pop("gpu_device_id", None)
+
         self.model = lgb.LGBMClassifier(**model_params)
         
         callbacks = []
@@ -96,21 +104,25 @@ class EntityMatcherModel:
                 callbacks=callbacks if callbacks else None
             )
         except Exception as e:
-            if "gpu" in str(model_params.get("device", "")).lower() or "cuda" in str(e).lower() or "gpu" in str(e).lower():
+            err = str(e).lower()
+            if model_params.get("device") == "gpu" or "cuda" in err or "gpu" in err:
                 logger.warning(
-                    f"[GPU FALLBACK: LightGBM GPU tree learner unavailable ({e}). "
-                    f"Falling back to multi-threaded CPU OpenMP]"
+                    "[GPU FALLBACK: LightGBM GPU unavailable (%s). "
+                    "Falling back to multi-threaded CPU OpenMP]",
+                    e,
                 )
                 model_params["device"] = "cpu"
+                model_params.pop("gpu_platform_id", None)
+                model_params.pop("gpu_device_id", None)
                 self.model = lgb.LGBMClassifier(**model_params)
                 self.model.fit(
                     X_train,
                     y_train,
                     eval_set=eval_set,
-                    callbacks=callbacks if callbacks else None
+                    callbacks=callbacks if callbacks else None,
                 )
             else:
-                raise e
+                raise
         
         elapsed = time.time() - start_t
         best_iter = getattr(self.model, "best_iteration_", self.model.n_estimators)

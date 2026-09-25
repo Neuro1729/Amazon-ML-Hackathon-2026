@@ -110,7 +110,8 @@ The pipeline is engineered to run seamlessly across local development and Kaggle
    - All candidate sets are processed per chunk and flushed to disk. No accumulation of query candidate dictionaries in memory.
    - Explicit memory release (`gc.collect()` and `torch.cuda.empty_cache()`) is executed between all major pipeline stages.
 4. **Zero Hardcoded Environment Values**:
-   - Paths are discovered automatically using `discover_dataset_paths()` checking `/kaggle/input`, local repository roots, and subdirectories.
+   - Paths are discovered relative to the clone via `discover_dataset_paths()` / `refresh_paths()` (`DATASET_DIR` env, `./dataset`, sibling `student_resource`, Colab Drive mounts; Kaggle input is optional fallback only).
+   - `output/`, `results/`, and `logs/` always live under the repository root unless overridden by env vars.
    - Optimal thresholds and margins are learned from the validation set and passed to inference, never hardcoded.
 
 ### Startup Monitoring Output:
@@ -210,8 +211,24 @@ student_resource/
 
 ## 7. Quick Start & Execution Guide
 
+### Colab GPU (recommended)
+
+See [COLAB.md](COLAB.md). Short version:
+
+```bash
+git clone https://github.com/Neuro1729/Amazon-ML-Hackathon-2026.git
+cd Amazon-ML-Hackathon-2026
+pip install -r requirements.txt
+# place dataset under ./dataset (or set DATASET_DIR), then:
+python scripts/train_model.py
+python scripts/evaluate.py
+python scripts/generate_submission.py
+```
+
+All `output/`, `results/`, and `logs/` are created **inside this clone** (relative paths). After mounting Drive or uploading data, call `refresh_paths()` from `src.config`.
+
 ### 1. Run Complete Executed Notebook
-The entire workflow can be executed directly in Jupyter or Kaggle:
+The entire workflow can be executed directly in Jupyter or Colab:
 ```bash
 python3 scripts/execute_notebook.py
 ```

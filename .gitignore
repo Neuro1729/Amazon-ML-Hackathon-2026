@@ -5,19 +5,25 @@ __pycache__/
 # Environments
 venv/
 .venv/
+.env
 
 # Jupyter
 .ipynb_checkpoints/
 
 # Data & Large Files
 dataset/
+student_resource/dataset/
 *.tsv
 *.zip
+*.pkl
 
+# Generated artifacts (keep folder placeholders)
 results/*
-
-# Generated Output
-output/
+!results/.gitkeep
+output/*
+!output/.gitkeep
+logs/*
+!logs/.gitkeep
 
 # OS
 .DS_Store
