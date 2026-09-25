@@ -101,6 +101,17 @@ def main():
     print(f"  Macro F0.5:     {best_f05:.4f}")
     print(f"  Macro Precision:{opt_results['best_precision']:.4f}")
     print(f"  Macro Recall:   {opt_results['best_recall']:.4f}")
+
+    from src.config import save_threshold_config
+    save_threshold_config(
+        abs_threshold=float(best_thresh),
+        margin_threshold=float(best_margin),
+        extra_metrics={
+            "macro_f0.5": float(best_f05),
+            "macro_precision": float(opt_results["best_precision"]),
+            "macro_recall": float(opt_results["best_recall"]),
+        },
+    )
     
     # 10. Run 10-stage ablation suite
     ablation_df = run_ablation_experiments(
